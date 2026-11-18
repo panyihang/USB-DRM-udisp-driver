@@ -1,8 +1,8 @@
 # USB DRM udisp driver
-A Linux DRM graphics driver for ESP32-P4 USB display devices
+A Linux DRM graphics driver for USB display devices using the udisp protocol
 
-Linux USB DRM/KMS 显示驱动，面向 `303a:2986` ESP 外接屏设备。  
-Linux USB DRM/KMS display driver for `303a:2986` ESP-based external screens.
+Linux USB DRM/KMS 显示驱动，面向 `303a:2986` / `303a:2987` udisp 外接屏设备。
+Linux USB DRM/KMS display driver for `303a:2986` / `303a:2987` udisp external screens.
 
 ## 项目简介 / Overview
 
@@ -133,3 +133,9 @@ options udisp_drm debug=1 connector_type=usb host_native=0 rotate=90 test_patter
 EOF
 sudo reboot
 ```
+## 更新 / Updates (0.1.5)
+
+- 修复 JPEG/缓冲区边界、帧提交同步和 USB 发送节流；默认输出 JFIF 4:2:0。
+- 修正 `Bl` 的 KiB 单位及 framebuffer 起始偏移。
+- 默认保留 DRM 节点以支持重连；`persistent_drm=0` 可禁用，`jpeg_subsampling=444` 可切换采样。
+- 提供 `dkms.conf`，支持 DKMS 自动重编译；USB 描述字符串不代表实际 SoC 型号。

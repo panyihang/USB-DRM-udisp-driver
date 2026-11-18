@@ -166,6 +166,9 @@ typedef struct {
     // Buffered output. Big performance win when using the usual stdlib implementations.
     size_t          output_buffer_count;
     uint8_t         output_buffer[TJEI_BUFFER_SIZE];
+    /* MCU scratch lives with the heap state, not on the kernel stack. */
+    FLOAT_INT32_T du_y[64], du_b[64], du_r[64];
+    int subsampling;
 } TJEState;
 
 // ============================================================
@@ -308,7 +311,7 @@ static uint16_t tjei_be_word(const uint16_t le_word)
 // while developing.
 // ============================================================
 
-static const uint8_t tjeik_jfif_id[] = "JFIF";
+
 static const uint8_t tjeik_com_str[] = "Created by Tiny JPEG Encoder";
 
 // TODO: Get rid of packed structs!
@@ -524,7 +527,7 @@ TJEI_FORCE_INLINE void tjei_write_bits(TJEState* state,
 
     // Push the stack.
     uint32_t nloc = *location + num_bits;
-    *bitbuffer |= (uint32_t)(bits << (32 - nloc));
+    *bitbuffer |= ((uint32_t)bits << (32 - nloc));
     *location = nloc;
     while(*location >= 8) {
         // Grab the most significant byte.
@@ -699,7 +702,10 @@ static void tjei_encode_and_write_MCU(TJEState* state,
 {
     int du[64];  // Data unit in zig-zag order
     int i;
-    int u, v, val, diff, last_non_zero_i;
+    int val, diff, last_non_zero_i;
+#if !TJE_USE_FAST_DCT
+    int u, v;
+#endif
     FLOAT_INT32_T dct_mcu[64];
     uint16_t vli[2];
     memcpy(dct_mcu, mcu, 64 * sizeof(FLOAT_INT32_T));
@@ -859,7 +865,7 @@ static OPTIMIZE_ATTR int tjei_encode_main(TJEState* state,
         return 0;
     }
 
-    if(width > 0xffff || height > 0xffff) {
+    if(!src_data || width <= 0 || height <= 0 || width > 0xffff || height > 0xffff) {
         return 0;
     }
 
@@ -900,35 +906,13 @@ static OPTIMIZE_ATTR int tjei_encode_main(TJEState* state,
         }
     }
 #endif
-#if 0
-
-    {
-        // Write header
-        TJEJPEGHeader header;
-        // JFIF header.
-        header.SOI = tjei_be_word(0xffd8);  // Sequential DCT
-        header.APP0 = tjei_be_word(0xffe0);
-
-        uint16_t jfif_len = sizeof(TJEJPEGHeader) - 4 /*SOI & APP0 markers*/;
-        header.jfif_len = tjei_be_word(jfif_len);
-        memcpy(header.jfif_id, (void*)tjeik_jfif_id, 5);
-        header.version = tjei_be_word(0x0102);
-        header.units = 0x01;  // Dots-per-inch
-        header.x_density = tjei_be_word(0x0060);  // 96 DPI
-        header.y_density = tjei_be_word(0x0060);  // 96 DPI
-        header.x_thumb = 0;
-        header.y_thumb = 0;
-        tjei_write(state, &header, sizeof(TJEJPEGHeader), 1);
-    }
-#else
-//we doesn't support a standard jpeg,so the APP0 we delete it
-//the device side also ignore it
-    uint16_t SOI;
-    SOI = tjei_be_word(0xffd8);  // Sequential DCT
-    tjei_write(state, &SOI, sizeof(SOI), 1);
-
-
-#endif
+    /* Standard JFIF, matching the Windows libjpeg default header. */
+    static const uint8_t jfif_header[] = {
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10,
+        'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00
+    };
+    tjei_write(state, jfif_header, sizeof(jfif_header), 1);
 #if 0
 //delete comment for speed
     {
@@ -965,7 +949,7 @@ static OPTIMIZE_ATTR int tjei_encode_main(TJEState* state,
         for(i = 0; i < 3; ++i) {
             TJEComponentSpec spec;
             spec.component_id = (uint8_t)(i + 1);  // No particular reason. Just 1, 2, 3.
-            spec.sampling_factors = (uint8_t)0x11;
+            spec.sampling_factors = (i == 0 && state->subsampling == 2) ? 0x22 : 0x11;
             spec.qt = tables[i];
 
             header.component_spec[i] = spec;
@@ -1007,9 +991,9 @@ static OPTIMIZE_ATTR int tjei_encode_main(TJEState* state,
     }
     // Write compressed data.
 
-    FLOAT_INT32_T du_y[64];
-    FLOAT_INT32_T du_b[64];
-    FLOAT_INT32_T du_r[64];
+    FLOAT_INT32_T *du_y = state->du_y;
+    FLOAT_INT32_T *du_b = state->du_b;
+    FLOAT_INT32_T *du_r = state->du_r;
 
     // Set diff to 0.
     int pred_y = 0;
@@ -1021,6 +1005,78 @@ static OPTIMIZE_ATTR int tjei_encode_main(TJEState* state,
     uint32_t location = 0;
 
 
+    if (state->subsampling == 2) {
+        /* Interleaved 4:2:0 MCU order: Y00, Y01, Y10, Y11, Cb, Cr.
+         * Header sampling alone is insufficient: entropy block order and
+         * the 2x2 chroma average must agree with the 16x16 MCU geometry.
+         */
+        for (y = 0; y < height; y += 16) {
+            for (x = 0; x < width; x += 16) {
+                int by, bx, dy, dx;
+                for (by = 0; by < 2; by++) {
+                    for (bx = 0; bx < 2; bx++) {
+                        for (off_y = 0; off_y < 8; off_y++) {
+                            int row = tjei_min(y + by * 8 + off_y, height - 1);
+                            for (off_x = 0; off_x < 8; off_x++) {
+                                int col = tjei_min(x + bx * 8 + off_x, width - 1);
+                                const uint8_t *p = src_data + (row * width + col) * src_num_components;
+                                du_y[off_y * 8 + off_x] =
+                                    FLOAT_2_INT32(0.299f) * p[0] +
+                                    FLOAT_2_INT32(0.587f) * p[1] +
+                                    FLOAT_2_INT32(0.114f) * p[2] - FLOAT_2_INT32(128);
+                            }
+                        }
+            tjei_encode_and_write_MCU(state, du_y,
+#if TJE_USE_FAST_DCT
+                                      pqt.luma,
+#else
+                                      state->qt_luma,
+#endif
+                                      state->ehuffsize[TJEI_LUMA_DC], state->ehuffcode[TJEI_LUMA_DC],
+                                      state->ehuffsize[TJEI_LUMA_AC], state->ehuffcode[TJEI_LUMA_AC],
+                                      &pred_y, &bitbuffer, &location);
+
+                    }
+                }
+                for (off_y = 0; off_y < 8; off_y++) {
+                    for (off_x = 0; off_x < 8; off_x++) {
+                        FLOAT_INT32_T cb = 0, cr = 0;
+                        for (dy = 0; dy < 2; dy++) {
+                            int row = tjei_min(y + off_y * 2 + dy, height - 1);
+                            for (dx = 0; dx < 2; dx++) {
+                                int col = tjei_min(x + off_x * 2 + dx, width - 1);
+                                const uint8_t *p = src_data + (row * width + col) * src_num_components;
+                                cb += FLOAT_2_INT32(-0.1687f) * p[0] -
+                                      FLOAT_2_INT32(0.3313f) * p[1] + FLOAT_2_INT32(0.5f) * p[2];
+                                cr += FLOAT_2_INT32(0.5f) * p[0] -
+                                      FLOAT_2_INT32(0.4187f) * p[1] - FLOAT_2_INT32(0.0813f) * p[2];
+                            }
+                        }
+                        du_b[off_y * 8 + off_x] = cb / 4;
+                        du_r[off_y * 8 + off_x] = cr / 4;
+                    }
+                }
+            tjei_encode_and_write_MCU(state, du_b,
+#if TJE_USE_FAST_DCT
+                                      pqt.chroma,
+#else
+                                      state->qt_chroma,
+#endif
+                                      state->ehuffsize[TJEI_CHROMA_DC], state->ehuffcode[TJEI_CHROMA_DC],
+                                      state->ehuffsize[TJEI_CHROMA_AC], state->ehuffcode[TJEI_CHROMA_AC],
+                                      &pred_b, &bitbuffer, &location);
+            tjei_encode_and_write_MCU(state, du_r,
+#if TJE_USE_FAST_DCT
+                                      pqt.chroma,
+#else
+                                      state->qt_chroma,
+#endif
+                                      state->ehuffsize[TJEI_CHROMA_DC], state->ehuffcode[TJEI_CHROMA_DC],
+                                      state->ehuffsize[TJEI_CHROMA_AC], state->ehuffcode[TJEI_CHROMA_AC],
+                                      &pred_r, &bitbuffer, &location);
+            }
+        }
+    } else {
     for(y = 0; y < height; y += 8) {
         for(x = 0; x < width; x += 8) {
             // Block loop: ====
@@ -1087,11 +1143,14 @@ static OPTIMIZE_ATTR int tjei_encode_main(TJEState* state,
         }
     }
 
+    }
+
     // Finish the image.
     {
         // Flush
         if(location > 0 && location < 8) {
-            tjei_write_bits(state, &bitbuffer, &location, (uint16_t)(8 - location), 0);
+            tjei_write_bits(state, &bitbuffer, &location, (uint16_t)(8 - location),
+                             (uint16_t)((1u << (8 - location)) - 1));
         }
     }
     uint16_t EOI = tjei_be_word(0xffd9);
@@ -1120,12 +1179,14 @@ int tje_encode_to_ctx(void * ctx,
 static void tjei_stdlib_func(void* context, void* data, int size)
 {
     stream_mgr_t* sg = (stream_mgr_t*)context;
-    //fwrite(data, size, 1, fd);
-    if(sg->dp + size < sg->max) {
-        memcpy(&sg->data[sg->dp], data, size);
-        sg->dp += size;
-    } else
-        LOGW("%s over max %d %d %d\n", __FUNCTION__, sg->dp, size, sg->max);
+    if (sg->overflow)
+        return;
+    if (size < 0 || sg->dp < 0 || sg->dp > sg->max || size > sg->max - sg->dp) {
+        sg->overflow = 1;
+        return;
+    }
+    memcpy(&sg->data[sg->dp], data, size);
+    sg->dp += size;
 }
 
 // Define public interface.
@@ -1138,12 +1199,20 @@ int tje_encode_to_ctx_at_quality(void * ctx,
 {
 
 
-    int result = tje_encode_with_func(tjei_stdlib_func, ctx,
+    stream_mgr_t *sg = ctx;
+    int result;
+
+    if (!sg || !sg->data || sg->max <= 0 ||
+        (sg->subsampling != 0 && sg->subsampling != 2))
+        return 0;
+    sg->dp = 0;
+    sg->overflow = 0;
+    result = tje_encode_with_func(tjei_stdlib_func, ctx,
                                       quality, width, height, num_components, src_data);
 
 
 
-    return result;
+    return result > 0 && !sg->overflow;
 }
 
 int tje_encode_with_func(tje_write_func* func,
@@ -1170,9 +1239,11 @@ int tje_encode_with_func(tje_write_func* func,
     pstate=xmalloc(sizeof(TJEState));
 	if(!pstate){
 		LOGW("state malloc NG\n");
-		return -1;
+		return 0;
     }
 	memset(pstate,0,sizeof(TJEState));
+    if (func == tjei_stdlib_func)
+        pstate->subsampling = ((stream_mgr_t *)context)->subsampling;
     //LOGI("%s w:%d h:%d c:%d quality:%d\n",__FUNCTION__,width,height,num_components,quality);
     switch(quality) {
     case MAX_JPG_QUAILITY:
@@ -1193,7 +1264,11 @@ int tje_encode_with_func(tje_write_func* func,
         qt_factor = quality;//less size but less quality 13.xfps
         //qt_factor = 2;//13.xfps
         //qt_factor = 4;//13.xfps
-        // don't break. fall through.
+        #ifdef __KERNEL__
+        fallthrough;
+#else
+        __attribute__((fallthrough));
+#endif
     case 1:
         for(i = 0; i < 64; ++i) {
             pstate->qt_luma[i]   = tjei_default_qt_luma_from_spec[i] / qt_factor;

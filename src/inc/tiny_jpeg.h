@@ -234,6 +234,8 @@ extern "C"
         uint8_t * data;
         int max;
         int   dp;
+        int overflow;
+        int subsampling; /* 0: 4:4:4, 2: 4:2:0. */
     } stream_mgr_t;
 
 

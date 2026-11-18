@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/module.h>
+#include <linux/kref.h>
+#include <linux/list.h>
+#include <linux/platform_device.h>
+#include <linux/dma-mapping.h>
+#include <linux/delay.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
@@ -30,19 +35,32 @@
 
 #define UDISP_USB_VID 0x303a
 #define UDISP_USB_PID 0x2986
+#define UDISP_USB_PID_DISPLAY 0x2987
 #define UDISP_VENDOR_INTERFACE 0
 #define UDISP_TYPE_RGB565 0
 #define UDISP_TYPE_JPG 3
+#define UDISP_TYPE_END 0xff
 
 #define UDISP_DEFAULT_WIDTH 452
 #define UDISP_DEFAULT_HEIGHT 1280
 #define UDISP_DEFAULT_FPS 45
 #define UDISP_DEFAULT_LIMIT 300000
 #define UDISP_DEFAULT_KEEPALIVE_MS 10000
-#define UDISP_MAX_TRANSFER (8 * 1024 * 1024)
+#define UDISP_MAX_PAYLOAD 0x003fffffU
+#define UDISP_MAX_TRANSFER (UDISP_MAX_PAYLOAD + 16)
 #define UDISP_JPEG_ALIGN 16
 #define UDISP_RING_SLOTS 3
 #define UDISP_ROTATE_TILE_ROWS 32
+
+/* Keep the KMS device stable across cable reconnects.  In particular, older
+ * compositors cannot reliably remove/re-add a secondary GPU at the same minor.
+ */
+static bool persistent_drm = true;
+module_param(persistent_drm, bool, 0444);
+MODULE_PARM_DESC(persistent_drm, "retain the DRM device across USB disconnect/reconnect (default true)");
+
+static LIST_HEAD(udisp_devices);
+static DEFINE_MUTEX(udisp_devices_lock);
 
 static int rotate = 90;
 module_param(rotate, int, 0644);
@@ -63,6 +81,10 @@ MODULE_PARM_DESC(connector_type, "DRM connector type: usb, hdmi, dvi, virtual, d
 static int jpeg_quality;
 module_param(jpeg_quality, int, 0644);
 MODULE_PARM_DESC(jpeg_quality, "override device-reported JPEG quality when set to 1..10");
+
+static int jpeg_subsampling = 420;
+module_param(jpeg_subsampling, int, 0644);
+MODULE_PARM_DESC(jpeg_subsampling, "JPEG sampling: 420 (Windows-compatible default) or 444");
 
 static bool test_pattern;
 module_param(test_pattern, bool, 0644);
@@ -105,6 +127,9 @@ struct udisp_frame_slot {
 };
 
 struct udisp_device {
+	struct kref refcount;
+	struct list_head node;
+	struct platform_device *platform;
 	struct usb_device *udev;
 	struct usb_interface *intf;
 	u8 out_ep;
@@ -115,11 +140,13 @@ struct udisp_device {
 	struct drm_simple_display_pipe pipe;
 
 	struct delayed_work flush_work;
+	struct delayed_work hotplug_work;
 	struct work_struct send_work;
 	struct workqueue_struct *wq;
 	struct workqueue_struct *tx_wq;
 	struct mutex lock;
 	bool alive;
+	bool drm_ready;
 	bool enabled;
 	bool flush_pending;
 
@@ -135,6 +162,8 @@ struct udisp_device {
 	u32 frame_limit;
 	u16 frame_id;
 	unsigned long last_frame_jiffies;
+	u64 last_send_start_ns;
+	struct udisp_frame_header *end_header;
 	u64 frames_sent;
 	u64 frames_dropped;
 	u64 encode_failures;
@@ -162,7 +191,20 @@ struct udisp_device {
 	char product[128];
 	char serial[128];
 	char interface_name[128];
+	char usb_path[128];
 };
+
+/* USB probe and DRM open files have independent lifetimes. */
+static void udisp_device_release(struct kref *ref)
+{
+	struct udisp_device *ud = container_of(ref, struct udisp_device, refcount);
+
+	usb_put_intf(ud->intf);
+	usb_put_dev(ud->udev);
+	if (ud->platform)
+		platform_device_unregister(ud->platform);
+	kfree(ud);
+}
 
 static inline struct udisp_device *connector_to_udisp(struct drm_connector *connector)
 {
@@ -212,10 +254,21 @@ static unsigned long udisp_keepalive_delay(struct udisp_device *ud)
 
 static bool udisp_queue_keepalive_locked(struct udisp_device *ud)
 {
+	int i;
+
 	if (!ud->alive || !ud->enabled || !ud->current_fb || keepalive_ms <= 0)
 		return false;
 
-	udisp_queue_flush(ud, udisp_keepalive_delay(ud));
+	/* A queued JPEG will refresh last_frame_jiffies when USB completes.
+	 * Requeueing an overdue keepalive before then spins and fills the ring.
+	 * The sender rearms the timer after the last in-flight slot is freed.
+	 */
+	for (i = 0; i < UDISP_RING_SLOTS; i++)
+		if (ud->slots[i].busy)
+			return false;
+
+	udisp_queue_flush(ud, max_t(unsigned long, msecs_to_jiffies(20),
+				   udisp_keepalive_delay(ud)));
 	return true;
 }
 
@@ -373,21 +426,22 @@ static void udisp_parse_token(struct udisp_device *ud, const char *token)
 	int a;
 	int b;
 
-	if (sscanf(token, "R%dx%d", &a, &b) == 2 && a > 0 && b > 0) {
+	if (sscanf(token, "R%dx%d", &a, &b) == 2 && a > 0 && a <= 8192 && b > 0 && b <= 8192) {
 		ud->dev_width = a;
 		ud->dev_height = b;
 		return;
 	}
-	if (sscanf(token, "Fps%d", &a) == 1 && a > 0) {
+	if (sscanf(token, "Fps%d", &a) == 1 && a > 0 && a <= 240) {
 		ud->fps = a;
 		return;
 	}
-	if (sscanf(token, "Ejpg%d", &a) == 1 && a > 0) {
+	if (sscanf(token, "Ejpg%d", &a) == 1 && a >= 1 && a <= 10) {
 		ud->jpg_quality = a;
 		return;
 	}
 	if (sscanf(token, "Bl%d", &a) == 1 && a > 0) {
-		ud->frame_limit = a;
+		/* Windows protocol expresses Bl in KiB, not bytes. */
+		ud->frame_limit = min_t(u64, (u64)a * 1024, UDISP_MAX_PAYLOAD);
 		return;
 	}
 }
@@ -481,7 +535,8 @@ static enum drm_connector_status udisp_connector_detect(struct drm_connector *co
 {
 	struct udisp_device *ud = connector_to_udisp(connector);
 
-	return ud->alive ? connector_status_connected : connector_status_disconnected;
+	return READ_ONCE(ud->alive) && READ_ONCE(ud->drm_ready) ?
+		connector_status_connected : connector_status_disconnected;
 }
 
 static void udisp_mode_fill(struct drm_display_mode *mode,
@@ -577,6 +632,7 @@ static void udisp_pipe_enable(struct drm_simple_display_pipe *pipe,
 {
 	struct udisp_device *ud = pipe_to_udisp(pipe);
 	struct drm_framebuffer *fb = plane_state ? plane_state->fb : NULL;
+	bool queued = false;
 
 	mutex_lock(&ud->lock);
 	ud->enabled = true;
@@ -584,8 +640,16 @@ static void udisp_pipe_enable(struct drm_simple_display_pipe *pipe,
 		udisp_replace_fb_locked(&ud->current_fb, fb);
 		udisp_replace_fb_locked(&ud->pending_fb, fb);
 		udisp_queue_flush(ud, 0);
+		queued = true;
 	}
 	mutex_unlock(&ud->lock);
+
+	/* no_vblank reports completion as soon as this hook returns.  Keep
+	 * the compositor's scanout buffer owned until CPU capture is finished.
+	 * A framebuffer reference alone does not prevent producer reuse.
+	 */
+	if (queued)
+		flush_delayed_work(&ud->flush_work);
 }
 
 static void udisp_pipe_disable(struct drm_simple_display_pipe *pipe)
@@ -604,8 +668,7 @@ static void udisp_pipe_update(struct drm_simple_display_pipe *pipe,
 {
 	struct udisp_device *ud = pipe_to_udisp(pipe);
 	struct drm_framebuffer *fb = pipe->plane.state ? pipe->plane.state->fb : NULL;
-	unsigned long delay = 0;
-	unsigned long min_interval = ud->fps ? msecs_to_jiffies(DIV_ROUND_UP(1000, ud->fps)) : 0;
+	bool queued = false;
 
 	if (!fb)
 		return;
@@ -614,12 +677,17 @@ static void udisp_pipe_update(struct drm_simple_display_pipe *pipe,
 	if (ud->alive && ud->enabled) {
 		udisp_replace_fb_locked(&ud->current_fb, fb);
 		udisp_replace_fb_locked(&ud->pending_fb, fb);
-		if (min_interval && ud->last_frame_jiffies &&
-		    time_before(jiffies, ud->last_frame_jiffies + min_interval))
-			delay = (ud->last_frame_jiffies + min_interval) - jiffies;
-		udisp_queue_flush(ud, delay);
+		udisp_queue_flush(ud, 0);
+		queued = true;
 	}
 	mutex_unlock(&ud->lock);
+
+	/* Must complete the snapshot BEFORE DRM sends its fake page-flip
+	 * event and allows the compositor to reuse the previous buffers.
+	 * JPEG/USB data remains private to the ring after this barrier.
+	 */
+	if (queued)
+		flush_delayed_work(&ud->flush_work);
 }
 
 static const struct drm_simple_display_pipe_funcs udisp_pipe_funcs = {
@@ -941,12 +1009,39 @@ static int udisp_usb_send_jpeg(struct udisp_device *ud, struct udisp_frame_slot 
     hdr->height = cpu_to_le16(ud->dev_height);
     hdr->frame_payload = udisp_pack_frame_payload(ud->frame_id++, slot->payload_len);
 
+    /* Rate-limit the actual USB sender, not a deferred framebuffer read.
+     * Otherwise ready slots can drain back-to-back after a scheduling stall.
+     */
+    if (ud->fps && ud->last_send_start_ns) {
+        u64 deadline = ud->last_send_start_ns + DIV_ROUND_UP_ULL(NSEC_PER_SEC, ud->fps);
+        u64 now = ktime_get_ns();
+
+        if (deadline > now) {
+            unsigned long wait_us = DIV_ROUND_UP_ULL(deadline - now, NSEC_PER_USEC);
+
+            usleep_range(wait_us, wait_us + 100);
+        }
+    }
+    ud->last_send_start_ns = ktime_get_ns();
     ret = usb_bulk_msg(ud->udev, usb_sndbulkpipe(ud->udev, ud->out_ep),
                        slot->tx_buf, total, &actual, 1000);
     if (ret)
         return ret;
     if (actual != total)
         return -EIO;
+
+    /* Match Windows: an exact max-packet boundary needs a short END
+     * transfer, so TinyUSB does not wait for the next frame to flush it.
+     * end_header is kmalloc-backed; USB DMA must never use stack memory.
+     */
+    if (ud->out_ep_size && !(total % ud->out_ep_size)) {
+        ret = usb_bulk_msg(ud->udev, usb_sndbulkpipe(ud->udev, ud->out_ep),
+                           ud->end_header, sizeof(*ud->end_header), &actual, 1000);
+        if (ret)
+            return ret;
+        if (actual != sizeof(*ud->end_header))
+            return -EIO;
+    }
     ud->last_frame_jiffies = jiffies;
     ud->frames_sent++;
     if (debug)
@@ -1028,6 +1123,8 @@ static void udisp_send_work(struct work_struct *work)
 		mutex_lock(&ud->lock);
 		slot->busy = false;
 		slot->ready = false;
+		if (!ud->pending_fb && !delayed_work_pending(&ud->flush_work))
+			udisp_queue_keepalive_locked(ud);
 		mutex_unlock(&ud->lock);
 	}
 }
@@ -1038,7 +1135,7 @@ static void udisp_flush_work(struct work_struct *work)
 	struct udisp_device *ud = container_of(dwork, struct udisp_device, flush_work);
 	struct drm_framebuffer *fb;
 	struct udisp_frame_slot *slot = NULL;
-	struct iosys_map map;
+	struct iosys_map map, data;
 	int ret;
 	u8 *payload;
 	u64 t0 = ktime_get_ns();
@@ -1109,17 +1206,17 @@ static void udisp_flush_work(struct work_struct *work)
 	if (ret)
 		goto out;
 
-	ret = drm_gem_fb_vmap(fb, &map, NULL);
+	ret = drm_gem_fb_vmap(fb, &map, &data);
 	if (!ret) {
 		stream_mgr_t mgr;
 		u8 quality;
 		u64 t1;
 		u64 t2;
 
-		slot->iomem = map.is_iomem;
+		slot->iomem = data.is_iomem;
 		payload = slot->tx_buf + sizeof(struct udisp_frame_header);
 		t_map = ktime_get_ns();
-		udisp_write_fb_to_rgb(ud, fb, slot->jpg_src, &map);
+		udisp_write_fb_to_rgb(ud, fb, slot->jpg_src, &data);
 		t1 = ktime_get_ns();
 		slot->t_convert = t1 - t_map;
 
@@ -1128,6 +1225,7 @@ static void udisp_flush_work(struct work_struct *work)
 			mgr.data = payload;
 			mgr.max = ud->tx_buf_size - sizeof(struct udisp_frame_header);
 			mgr.dp = 0;
+			mgr.subsampling = jpeg_subsampling == 444 ? 0 : 2;
 			if (!tje_encode_to_ctx(&mgr, ud->jpg_width, ud->jpg_height, 3,
 					       slot->jpg_src, quality))
 				continue;
@@ -1225,6 +1323,7 @@ static void udisp_drm_release(struct drm_device *drm, void *ptr)
 	struct udisp_device *ud = ptr;
 	int i;
 
+	cancel_delayed_work_sync(&ud->hotplug_work);
 	cancel_delayed_work_sync(&ud->flush_work);
 	cancel_work_sync(&ud->send_work);
 	if (ud->wq) {
@@ -1249,11 +1348,14 @@ static void udisp_drm_release(struct drm_device *drm, void *ptr)
 		ud->slots[i].jpg_src = NULL;
 		ud->slots[i].tx_buf = NULL;
 	}
+	kfree(ud->end_header);
+	ud->end_header = NULL;
 	kfree(ud->last_tx_buf);
 	ud->last_tx_buf = NULL;
 	kfree(ud->rotate_buf);
 	ud->rotate_buf = NULL;
 	kfree(ud->line_buf);
+	kref_put(&ud->refcount, udisp_device_release);
 }
 
 static int udisp_drm_init(struct udisp_device *ud)
@@ -1263,13 +1365,15 @@ static int udisp_drm_init(struct udisp_device *ud)
 	int i;
 	size_t transfer_len;
 
-	drm = drm_dev_alloc(&udisp_drm_driver, &ud->intf->dev);
+	drm = drm_dev_alloc(&udisp_drm_driver, ud->platform ?
+			    &ud->platform->dev : &ud->intf->dev);
 	if (IS_ERR(drm))
 		return PTR_ERR(drm);
 
 	ud->drm = drm;
 	drm->dev_private = ud;
 
+	kref_get(&ud->refcount);
 	ret = drmm_add_action_or_reset(drm, udisp_drm_release, ud);
 	if (ret)
 		goto err_put;
@@ -1315,6 +1419,12 @@ static int udisp_drm_init(struct udisp_device *ud)
 			goto err_put;
 		}
 	}
+	ud->end_header = kzalloc(sizeof(*ud->end_header), GFP_KERNEL);
+	if (!ud->end_header) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
+	ud->end_header->type = UDISP_TYPE_END;
 	ud->last_tx_buf = kmalloc(ud->tx_buf_size, GFP_KERNEL);
 	if (!ud->last_tx_buf) {
 		ret = -ENOMEM;
@@ -1348,10 +1458,102 @@ err_put:
 	return ret;
 }
 
+/* Update the cached connector state before emitting HOTPLUG.  Re-emitting a
+ * uevent with an unchanged state is insufficient for some compositors.
+ */
+static void udisp_notify_hotplug(struct udisp_device *ud)
+{
+	mutex_lock(&ud->drm->mode_config.mutex);
+	ud->connector.funcs->fill_modes(&ud->connector,
+		ud->drm->mode_config.max_width, ud->drm->mode_config.max_height);
+	mutex_unlock(&ud->drm->mode_config.mutex);
+	drm_kms_helper_hotplug_event(ud->drm);
+}
+
+/* Let userspace register a newly added secondary GPU while it is disconnected,
+ * then publish the connector transition.  Otherwise an early hotplug event can
+ * be consumed before the compositor has a KMS resource object for this GPU.
+ */
+static void udisp_initial_hotplug_work(struct work_struct *work)
+{
+	struct udisp_device *ud = container_of(to_delayed_work(work),
+					      struct udisp_device, hotplug_work);
+
+	mutex_lock(&ud->lock);
+	if (!ud->alive) {
+		mutex_unlock(&ud->lock);
+		return;
+	}
+	ud->drm_ready = true;
+	mutex_unlock(&ud->lock);
+	udisp_notify_hotplug(ud);
+}
+
+/* The pool owns one kref and one drm_dev reference until module teardown.
+ * A USB binding owns a separate kref and may disappear without unplugging KMS.
+ */
+static struct udisp_device *udisp_find_disconnected(struct udisp_device *info)
+{
+	struct udisp_device *ud;
+
+	list_for_each_entry(ud, &udisp_devices, node) {
+		if (ud->alive || !ud->drm)
+			continue;
+		if (!strcmp(ud->usb_path, info->usb_path) &&
+		    !strcmp(ud->product, info->product) &&
+		    !strcmp(ud->serial, info->serial) &&
+		    ud->host_width == info->host_width &&
+		    ud->host_height == info->host_height &&
+		    ud->frame_limit == info->frame_limit)
+			return ud;
+	}
+	return NULL;
+}
+
+static void udisp_reattach(struct udisp_device *ud, struct udisp_device *info)
+{
+	struct usb_device *old_udev = ud->udev;
+	struct usb_interface *old_intf = ud->intf;
+	int i;
+
+	/* Previous disconnect finished both workers under udisp_devices_lock. */
+	mutex_lock(&ud->lock);
+	ud->udev = usb_get_dev(info->udev);
+	ud->intf = usb_get_intf(info->intf);
+	ud->out_ep = info->out_ep;
+	ud->out_ep_size = info->out_ep_size;
+	ud->fps = info->fps;
+	ud->jpg_quality = info->jpg_quality;
+	ud->enabled = false;
+	ud->has_last_frame = false;
+	ud->last_payload_len = 0;
+	ud->last_frame_jiffies = 0;
+	ud->last_send_start_ns = 0;
+	ud->frame_id = 0;
+	ud->last_stat_ns = 0;
+	ud->last_stat_frames = ud->frames_sent;
+	ud->flush_pending = false;
+	for (i = 0; i < UDISP_RING_SLOTS; i++) {
+		ud->slots[i].busy = false;
+		ud->slots[i].ready = false;
+	}
+	ud->alive = true;
+	ud->drm_ready = true;
+	mutex_unlock(&ud->lock);
+
+	usb_put_intf(old_intf);
+	usb_put_dev(old_udev);
+	kref_get(&ud->refcount); /* new USB binding */
+	usb_set_intfdata(info->intf, ud);
+	udisp_notify_hotplug(ud);
+	dev_info(&ud->intf->dev,
+		 "USB reconnected: reused existing DRM device and connector\n");
+}
+
 static int udisp_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_host_interface *alt = intf->cur_altsetting;
-	struct udisp_device *ud;
+	struct udisp_device *ud, *existing;
 	int i;
 	int ret;
 
@@ -1361,60 +1563,90 @@ static int udisp_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	ud = kzalloc(sizeof(*ud), GFP_KERNEL);
 	if (!ud)
 		return -ENOMEM;
-
+	kref_init(&ud->refcount);
+	INIT_LIST_HEAD(&ud->node);
 	ud->udev = usb_get_dev(interface_to_usbdev(intf));
-	ud->intf = intf;
+	ud->intf = usb_get_intf(intf);
 	mutex_init(&ud->lock);
 	INIT_DELAYED_WORK(&ud->flush_work, udisp_flush_work);
+	INIT_DELAYED_WORK(&ud->hotplug_work, udisp_initial_hotplug_work);
 	INIT_WORK(&ud->send_work, udisp_send_work);
 	ud->alive = true;
+	ud->drm_ready = !persistent_drm;
 
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
-
 		if (usb_endpoint_is_bulk_out(ep)) {
 			ud->out_ep = ep->bEndpointAddress;
 			ud->out_ep_size = usb_endpoint_maxp(ep);
 			break;
 		}
 	}
-
 	if (!ud->out_ep) {
 		ret = -ENODEV;
 		goto err_free;
 	}
+	udisp_parse_usb_strings(ud);
+	if (usb_make_path(ud->udev, ud->usb_path, sizeof(ud->usb_path)) < 0)
+		strscpy(ud->usb_path, dev_name(&intf->dev), sizeof(ud->usb_path));
 
-	ud->wq = alloc_ordered_workqueue("udisp_drm_wq",
-					 WQ_UNBOUND | WQ_MEM_RECLAIM);
+	mutex_lock(&udisp_devices_lock);
+	if (persistent_drm) {
+		existing = udisp_find_disconnected(ud);
+		if (existing) {
+			udisp_reattach(existing, ud);
+			mutex_unlock(&udisp_devices_lock);
+			kref_put(&ud->refcount, udisp_device_release);
+			return 0;
+		}
+		/* The parent must outlive the USB interface, otherwise removing USB
+		 * would also remove the KMS node from sysfs regardless of our refs.
+		 */
+		ud->platform = platform_device_register_simple("udisp-display",
+					 PLATFORM_DEVID_AUTO, NULL, 0);
+		if (IS_ERR(ud->platform)) {
+			ret = PTR_ERR(ud->platform);
+			ud->platform = NULL;
+			goto err_unlock;
+		}
+		ret = dma_coerce_mask_and_coherent(&ud->platform->dev, DMA_BIT_MASK(64));
+		if (ret)
+			goto err_unlock;
+	}
+
+	ud->wq = alloc_ordered_workqueue("udisp_drm_wq", WQ_UNBOUND | WQ_MEM_RECLAIM);
 	if (!ud->wq) {
 		ret = -ENOMEM;
-		goto err_free;
+		goto err_unlock;
 	}
-	ud->tx_wq = alloc_ordered_workqueue("udisp_drm_tx_wq",
-					    WQ_UNBOUND | WQ_MEM_RECLAIM);
+	ud->tx_wq = alloc_ordered_workqueue("udisp_drm_tx_wq", WQ_UNBOUND | WQ_MEM_RECLAIM);
 	if (!ud->tx_wq) {
 		ret = -ENOMEM;
-		goto err_free;
+		goto err_unlock;
 	}
-
-	udisp_parse_usb_strings(ud);
 	usb_set_intfdata(intf, ud);
-
 	ret = udisp_drm_init(ud);
 	if (ret)
-		goto err_free;
-
-	dev_info(&intf->dev, "USB DRM udisp connected on ep 0x%02x\n", ud->out_ep);
+		goto err_unlock;
+	if (persistent_drm) {
+		kref_get(&ud->refcount); /* reconnect pool */
+		list_add_tail(&ud->node, &udisp_devices);
+		mod_delayed_work(system_wq, &ud->hotplug_work, msecs_to_jiffies(1000));
+	}
+	mutex_unlock(&udisp_devices_lock);
+	dev_info(&intf->dev, "USB DRM udisp connected on ep 0x%02x (persistent=%d)\n",
+		 ud->out_ep, persistent_drm);
 	return 0;
 
+err_unlock:
+	mutex_unlock(&udisp_devices_lock);
 err_free:
 	usb_set_intfdata(intf, NULL);
 	if (ud->wq)
 		destroy_workqueue(ud->wq);
 	if (ud->tx_wq)
 		destroy_workqueue(ud->tx_wq);
-	usb_put_dev(ud->udev);
-	kfree(ud);
+	kref_put(&ud->refcount, udisp_device_release);
 	return ret;
 }
 
@@ -1425,36 +1657,75 @@ static void udisp_usb_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 	if (!ud)
 		return;
-
+	mutex_lock(&udisp_devices_lock);
 	mutex_lock(&ud->lock);
 	ud->alive = false;
+	ud->drm_ready = false;
+	ud->enabled = false;
+	mutex_unlock(&ud->lock);
+
+	cancel_delayed_work_sync(&ud->hotplug_work);
+	cancel_delayed_work_sync(&ud->flush_work);
+	cancel_work_sync(&ud->send_work);
+	mutex_lock(&ud->lock);
+	udisp_replace_fb_locked(&ud->pending_fb, NULL);
+	udisp_replace_fb_locked(&ud->current_fb, NULL);
+	ud->has_last_frame = false;
 	mutex_unlock(&ud->lock);
 
 	if (ud->drm) {
-		drm_dev_unplug(ud->drm);
-		drm_atomic_helper_shutdown(ud->drm);
-		drm_dev_put(ud->drm);
+		if (persistent_drm) {
+			drm_atomic_helper_shutdown(ud->drm);
+			udisp_notify_hotplug(ud);
+			dev_info(&intf->dev, "USB disconnected: DRM node retained for reconnect\n");
+		} else {
+			drm_dev_unplug(ud->drm);
+			drm_atomic_helper_shutdown(ud->drm);
+			drm_dev_put(ud->drm);
+		}
 	}
-
-	usb_put_dev(ud->udev);
-	kfree(ud);
+	mutex_unlock(&udisp_devices_lock);
+	kref_put(&ud->refcount, udisp_device_release); /* old USB binding */
 }
 
 static const struct usb_device_id udisp_usb_ids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(UDISP_USB_VID, UDISP_USB_PID, UDISP_VENDOR_INTERFACE) },
+	{ USB_DEVICE_INTERFACE_NUMBER(UDISP_USB_VID, UDISP_USB_PID_DISPLAY, UDISP_VENDOR_INTERFACE) },
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, udisp_usb_ids);
 
 static struct usb_driver udisp_usb_driver = {
-	.name = "udisp_drm",
+	.name = KBUILD_MODNAME,
 	.probe = udisp_usb_probe,
 	.disconnect = udisp_usb_disconnect,
 	.id_table = udisp_usb_ids,
 };
 
-module_usb_driver(udisp_usb_driver);
+static int __init udisp_init(void)
+{
+	return usb_register(&udisp_usb_driver);
+}
+
+static void __exit udisp_exit(void)
+{
+	struct udisp_device *ud, *next;
+
+	usb_deregister(&udisp_usb_driver);
+	mutex_lock(&udisp_devices_lock);
+	list_for_each_entry_safe(ud, next, &udisp_devices, node) {
+		list_del_init(&ud->node);
+		drm_dev_unplug(ud->drm);
+		drm_atomic_helper_shutdown(ud->drm);
+		drm_dev_put(ud->drm); /* pool's DRM device reference */
+		kref_put(&ud->refcount, udisp_device_release); /* pool's kref */
+	}
+	mutex_unlock(&udisp_devices_lock);
+}
+module_init(udisp_init);
+module_exit(udisp_exit);
 
 MODULE_AUTHOR("xfz1986/Codex");
 MODULE_DESCRIPTION("USB DRM/KMS driver for xfz1986 udisp devices");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("0.1.5");
